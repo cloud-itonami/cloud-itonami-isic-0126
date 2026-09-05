@@ -1,43 +1,45 @@
 (ns oleaginousops.render-html
   "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
-  Closes flagship checklist item 2 for this repo: it previously had no
-  demo page and no generator. This namespace drives the REAL actor stack
-  -- `oleaginousops.advisor` -> `oleaginousops.governor` ->
-  `oleaginousops.phase` -> `oleaginousops.operation/run-operation`,
-  against a real `oleaginousops.store/mem-store` -- and renders the page
-  from the audit facts that stack actually produced.
+  Drives the REAL OperationActor (`oleaginousops.operation/build` ->
+  advisor -> `oleaginousops.governor/check` -> `oleaginousops.phase/gate`)
+  over a REAL `oleaginousops.store/mem-store` plantation register, and
+  renders whatever that produced. Nothing on the page is a hand-typed
+  result:
 
-  There is deliberately NO hand-written HTML data here: every plantation
-  block on the page is read back out of the live Store, every
-  disposition / hold reason / violation detail / confidence / basis comes
-  out of `governor/check` and `phase/gate`, and even the action-gate and
-  phase-gate reference tables are derived from the real vars
-  (`governor/known-ops`, `governor/blocked-ops`,
-  `governor/always-escalate-ops`, `governor/confidence-floor`,
-  `facts/supply-categories`) or computed by actually calling
-  `phase/gate`. If the Governor's rules change, this page changes with
-  them.
+    - every plantation-register row is read back out of the Store
+      (`store/registered-plantation`, including for the subjects the
+      demo deliberately does NOT register),
+    - every run's disposition, reason, basis and confidence is the
+      actor's own return value / audit fact,
+    - every HARD-hold rule name and every violation detail string is the
+      Governor's own `:violations` entry -- never a literal here,
+    - the op-gate table's op sets, the confidence floor and the supply
+      cost thresholds are read from `oleaginousops.governor` /
+      `oleaginousops.facts` public vars,
+    - the phase-gate table is computed by CALLING `phase/gate` for each
+      phase, not transcribed from its docstring.
 
-  This repo's `oleaginousops.operation/build` is the synchronous
-  flow (its docstring records that the langgraph-clj StateGraph wiring
-  is deferred, mirroring `berrynutops.operation`), so this renderer
-  drives that entry point rather than `langgraph.graph/run*`.
+  Ledger provenance: unlike the sibling actors that persist to their
+  Store, THIS repo's `store/Store` protocol is a plantation *register*
+  only (`registered-plantation`) and `operation/run-operation` RETURNS
+  its audit facts and its commit record rather than writing them. The
+  `:ledger` below is therefore the in-order concatenation of the
+  `:audit` vectors the real runs returned -- append-only, actor-produced,
+  nothing synthesised.
 
-  DETERMINISM: no timestamps, no random ids, no wall-clock reads. The
-  Store here needs no clock (`store/MemStore` holds only plantation
-  records); if it ever does, the epoch-ms must be passed in from the
-  caller rather than read here. Sets are sorted before rendering so map/
-  set iteration order cannot leak into the bytes. Two consecutive runs
-  are byte-identical.
+  Subject provenance: every plantation-id driven below is either seeded
+  into the Store by `plantation-seed` (`plantation-001`..`plantation-004`,
+  all four `oleaginousops.facts/fruit-classes` ids) or is the
+  deliberately UNREGISTERED `plantation-999`, whose only purpose is to
+  make the Governor's `:plantation-not-registered` HARD invariant fire
+  for real.
 
-  INVARIANT: `-main` refuses to write the file if the resulting ledger
-  contains zero `:governor-hold` facts. A console that cannot show a
-  HARD hold is not evidence that the Governor works, so the requirement
-  is enforced at build time rather than left as a convention.
+  Deterministic: no clock, no randomness, no network, no timestamps in
+  the page. Re-running writes a byte-identical file.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
-  (default `docs/samples/operator-console.html`)."
+  Run: `clojure -M:dev:render-html [out-file]`
+  (default out-file `docs/samples/operator-console.html`)."
   (:require [clojure.string :as str]
             [jp-go-dds.skin]
             [oleaginousops.advisor :as advisor]
@@ -47,183 +49,172 @@
             [oleaginousops.phase :as phase]
             [oleaginousops.store :as store]))
 
-;; --------------------------- seeded store ---------------------------
+;; ----------------------------- the seed -----------------------------
 
-(def ^:private seeded-plantations
-  "The plantation blocks registered in the Store before the scenario
-  runs. Registration is this actor's minimal unit of authority -- an
-  unregistered block is a HARD violation (`:plantation-not-registered`),
-  which is exactly what `plantation-909` below is used to demonstrate.
-  `:fruit-class` values are ids from `facts/fruit-classes`."
-  [["plantation-001" {:id "plantation-001"
-                      :name "Sungai Merah Estate — Block A"
-                      :fruit-class "oil-palm"
-                      :hectares 128}]
-   ["plantation-002" {:id "plantation-002"
-                      :name "Tanjung Bakau Smallholder Group — Block 2"
-                      :fruit-class "coconut"
-                      :hectares 34}]
-   ["plantation-003" {:id "plantation-003"
-                      :name "Kalamata Terrace — Grove 7"
-                      :fruit-class "olive"
-                      :hectares 12}]
-   ["plantation-004" {:id "plantation-004"
-                      :name "Waimea Kukui Stand — Block C"
-                      :fruit-class "candlenut"
-                      :hectares 9}]])
+(def ^:private plantation-seed
+  "Registered plantation blocks. One block per `facts/fruit-classes`
+  entry, so every oil crop this vertical recognises (oil palm, coconut,
+  olive, candlenut) is exercised by a real Store lookup."
+  {"plantation-001" {:id "plantation-001" :name "Selangor Block A"
+                     :fruit-class "oil-palm" :hectares 128.0}
+   "plantation-002" {:id "plantation-002" :name "Davao Grove 2"
+                     :fruit-class "coconut" :hectares 74.5}
+   "plantation-003" {:id "plantation-003" :name "Kalamata Terrace"
+                     :fruit-class "olive" :hectares 31.2}
+   "plantation-004" {:id "plantation-004" :name "Kona Kukui Stand"
+                     :fruit-class "candlenut" :hectares 12.8}})
 
-(def ^:private unregistered-plantation
-  "Never added to the Store -- referenced by one scenario step so the
-  console can show the `:plantation-not-registered` HARD hold."
-  "plantation-909")
+(def ^:private unregistered-subject
+  "Never seeded into the Store on purpose -- this is how the
+  `:plantation-not-registered` HARD invariant is reached honestly."
+  "plantation-999")
 
-(defn seed-store
-  "Build a fresh in-memory Store with `seeded-plantations` registered."
-  []
-  (store/mem-store {:initial-plantations (into {} seeded-plantations)}))
+;; ------------------------- rogue advisors ---------------------------
+;; `oleaginousops.advisor/Advisor` is an injection seam ("mock | real
+;; LLM", see its docstring). Two of the Governor's paths cannot be
+;; reached from a REQUEST alone, because the compliant MockAdvisor never
+;; emits them: a non-`:propose` effect, and a sub-floor confidence. They
+;; are exactly the paths that exist because the advisor is NOT trusted,
+;; so they are exercised by swapping in deliberately non-compliant
+;; advisors that delegate to the real MockAdvisor and then misbehave.
+;; The hold/escalation those produce is still computed by the real
+;; Governor -- nothing is appended by hand.
 
-;; ------------------------- probe advisor ---------------------------
-
-(defrecord DirectExecutionAdvisor []
+(defrecord ExecutingAdvisor []
   advisor/Advisor
-  (-advise [_advisor _store request]
-    ;; A deliberately misbehaving advisor: it proposes a
-    ;; perfectly ordinary, allowlisted op against a *registered* block,
-    ;; with high confidence -- but asks to EXECUTE rather than propose.
-    ;; The Advisor protocol is a swap seam (`operation/run-operation`
-    ;; takes `:advisor`), so this is a real alternate implementation of
-    ;; the real protocol, not a stub of the governor. It exists to prove
-    ;; the `:no-execution` HARD rule fires on advisor output the mock
-    ;; advisor can never produce.
-    {:op (:op request)
-     :effect :execute
-     :count (:count request 0)
-     :value {:plantation-id (:plantation-id request)
-             :record-type (:record-type request "harvest")
-             :count (:count request 0)}
-     :cites ["advisor-self-authorized"]
-     :summary "Advisor attempts to write the plantation record directly"
-     :confidence 0.99}))
+  (-advise [_ store request]
+    (assoc (advisor/-advise (advisor/mock-advisor) store request)
+           :effect :execute)))
 
-(defn direct-execution-advisor []
-  (DirectExecutionAdvisor.))
+(defrecord UnsureAdvisor [confidence]
+  advisor/Advisor
+  (-advise [_ store request]
+    (assoc (advisor/-advise (advisor/mock-advisor) store request)
+           :confidence confidence)))
 
-;; ---------------------------- scenario ------------------------------
+;; ----------------------------- the run ------------------------------
 
 (def ^:private operator
-  {:actor-id "oleaginous-ops-01" :role :plantation-operator})
+  {:actor-id "ops-1" :actor-role :plantation-operator})
 
-(def ^:private scenario
-  "One entry per actor run. `:request` and `:phase` are the caller's
-  input; everything rendered from a run is the actor's output.
+(defn- ctx [phase] (assoc operator :phase phase))
 
-  Coverage: three clean auto-commits, three human escalations (one
-  always-escalate crop-health flag, one over-threshold supply order, one
-  phase-0 simulation gate), and five HARD holds -- one per hard rule in
-  `oleaginousops.governor` -- which never reach a human."
-  [{:label "harvest yield logged"
-    :phase :phase-3
-    :request {:op :log-plantation-record
-              :plantation-id "plantation-001"
-              :record-type "harvest"
-              :count 4820
-              :notes "FFB bunches, week 14"}}
+(def ^:private scenarios
+  "One entry = one coordination request driven through the real actor.
+  `:feeds` describes only the INPUT (what this request hands the
+  Governor); the disposition, reason, basis and confidence columns of
+  the rendered timeline all come back from the run itself."
+  [{:tid "t01" :phase :phase-3
+    :feeds "Routine harvest record against a registered oil-palm block, positive bunch count."
+    :request {:op :log-plantation-record :plantation-id "plantation-001"
+              :record-type "harvest" :count 4820 :notes "FFB bunches, week 31"}}
 
-   {:label "pruning round scheduled"
-    :phase :phase-2
-    :request {:op :schedule-field-operation
-              :plantation-id "plantation-002"
-              :requested-date "2026-09-02"
-              :operation-type "pruning"}}
+   {:tid "t02" :phase :phase-3
+    :feeds "Pruning window on a registered coconut grove. Scheduling only -- no equipment is operated."
+    :request {:op :schedule-field-operation :plantation-id "plantation-002"
+              :operation-type "pruning" :requested-date "2026-08-19"}}
 
-   {:label "fertilizer order under threshold"
-    :phase :phase-3
-    :request {:op :order-supplies
-              :plantation-id "plantation-003"
-              :category "fertilizer"
-              :cost 420}}
+   {:tid "t03" :phase :phase-3
+    :feeds "Fertilizer procurement at 420 units, under the fertilizer category threshold."
+    :request {:op :order-supplies :plantation-id "plantation-003"
+              :category "fertilizer" :cost 420}}
 
-   {:label "ganoderma suspected"
-    :phase :phase-3
-    :request {:op :flag-crop-health-concern
-              :plantation-id "plantation-001"
-              :concern "ganoderma basal stem rot suspected on 3 palms"}}
+   {:tid "t04" :phase :phase-3
+    :feeds "Equipment procurement at 1800 units, over the equipment category threshold."
+    :request {:op :order-supplies :plantation-id "plantation-004"
+              :category "equipment" :cost 1800}}
 
-   {:label "seedling order over threshold"
-    :phase :phase-3
-    :request {:op :order-supplies
-              :plantation-id "plantation-004"
-              :category "seedling"
-              :cost 1250}}
+   {:tid "t05" :phase :phase-3
+    :feeds "Seedling procurement at 900 units, over the seedling category threshold."
+    :request {:op :order-supplies :plantation-id "plantation-001"
+              :category "seedling" :cost 900}}
 
-   {:label "oil-content test logged during simulation rollout"
-    :phase :phase-0
-    :request {:op :log-plantation-record
-              :plantation-id "plantation-002"
-              :record-type "oil-content-test"
-              :count 63
-              :notes "lab assay, copra sample"}}
+   {:tid "t06" :phase :phase-3
+    :feeds "Crop-health concern (basal stem rot / Ganoderma) on the oil-palm block, advisor confidence 0.8."
+    :request {:op :flag-crop-health-concern :plantation-id "plantation-001"
+              :concern "basal stem rot (Ganoderma) suspected in rows 14-18"}}
 
-   {:label "record against an unregistered block"
-    :phase :phase-3
-    :request {:op :log-plantation-record
-              :plantation-id unregistered-plantation
-              :record-type "harvest"
-              :count 900}}
+   {:tid "t07" :phase :phase-0
+    :feeds "The same Governor-clean harvest record as t01, but submitted while the rollout is still in simulation."
+    :request {:op :log-plantation-record :plantation-id "plantation-002"
+              :record-type "oil-content-test" :count 1200 :notes "copra moisture panel"}}
 
-   {:label "record with a non-positive quantity"
-    :phase :phase-3
-    :request {:op :log-plantation-record
-              :plantation-id "plantation-001"
-              :record-type "harvest"
-              :count 0
-              :notes "operator typo"}}
+   {:tid "t08" :phase :phase-1
+    :feeds "Crop-health concern on the olive terrace under supervised rollout."
+    :request {:op :flag-crop-health-concern :plantation-id "plantation-003"
+              :concern "drought stress across the upper terrace"}}
 
-   {:label "advisor asks to run the harvester itself"
-    :phase :phase-3
-    :request {:op :operate-field-equipment
-              :plantation-id "plantation-001"}}
+   {:tid "t09" :phase :phase-3
+    :feeds "Harvest record for a plantation-id that was never registered in the Store."
+    :request {:op :log-plantation-record :plantation-id unregistered-subject
+              :record-type "harvest" :count 300 :notes "block unknown to the register"}}
 
-   {:label "advisor asks to finalize a spray decision"
-    :phase :phase-3
-    :request {:op :finalize-spray-application
-              :plantation-id "plantation-002"}}
+   {:tid "t10" :phase :phase-3
+    :feeds "Harvest record on a registered block with a logged quantity of 0."
+    :request {:op :log-plantation-record :plantation-id "plantation-002"
+              :record-type "harvest" :count 0 :notes "nil delivery claimed"}}
 
-   {:label "op outside the closed allowlist"
-    :phase :phase-3
-    :request {:op :archive-plantation
-              :plantation-id "plantation-003"}}
+   {:tid "t11" :phase :phase-3
+    :feeds "A request to operate field equipment directly on the oil-palm block."
+    :request {:op :operate-field-equipment :plantation-id "plantation-001"
+              :notes "raise the harvester boom"}}
 
-   {:label "advisor proposes :execute instead of :propose"
-    :phase :phase-3
-    :advisor :direct-execution
-    :request {:op :log-plantation-record
-              :plantation-id "plantation-004"
-              :record-type "planting"
-              :count 610}}])
+   {:tid "t12" :phase :phase-3
+    :feeds "A request to finalize a spray application on the olive terrace."
+    :request {:op :finalize-spray-application :plantation-id "plantation-003"
+              :notes "commit the copper spray decision"}}
 
-(defn run-scenario!
-  "Runs every `scenario` step through the real actor against a freshly
-  seeded Store. Returns `{:store st :runs [...] :ledger [...]}` where
-  each run carries the actor's own `:disposition`, `:audit`, `:record`
-  and `:verdict`, and `:ledger` is every audit fact in the order the
-  actor emitted them."
+   {:tid "t13" :phase :phase-3
+    :feeds "An op outside the closed allowlist (land clearing approval)."
+    :request {:op :approve-land-clearing :plantation-id "plantation-004"
+              :notes "clear the adjoining parcel"}}
+
+   {:tid "t14" :phase :phase-3 :advisor (->ExecutingAdvisor)
+    :feeds "A Governor-clean harvest record, but the advisor is swapped for one that returns :effect :execute."
+    :request {:op :log-plantation-record :plantation-id "plantation-001"
+              :record-type "harvest" :count 900 :notes "advisor attempts direct actuation"}}
+
+   {:tid "t15" :phase :phase-3 :advisor (->UnsureAdvisor 0.45)
+    :feeds "A routine scheduling request, but the advisor is swapped for one that reports confidence 0.45."
+    :request {:op :schedule-field-operation :plantation-id "plantation-004"
+              :operation-type "harvest" :requested-date "2026-09-02"}}
+
+   {:tid "t16" :phase :phase-3
+    :feeds "Two invariants at once: field-equipment operation AND an unregistered plantation-id."
+    :request {:op :operate-field-equipment :plantation-id unregistered-subject
+              :notes "boom raise on an unknown block"}}
+
+   {:tid "t17" :phase :phase-9
+    :feeds "The same Governor-clean pruning request as t02, submitted under a phase the gate does not recognise."
+    :request {:op :schedule-field-operation :plantation-id "plantation-002"
+              :operation-type "pruning" :requested-date "2026-08-26"}}])
+
+(defn run-demo!
+  "Seeds a real `store/mem-store`, builds the real OperationActor for
+  each scenario (swapping the injected advisor where the scenario asks
+  for one) and runs every request through advisor -> governor -> phase
+  gate. Returns `{:store st :runs [...] :ledger [...]}` where `:runs`
+  carries the actor's own `{:disposition :audit :record :verdict}` per
+  request and `:ledger` is the in-order concatenation of the audit facts
+  those runs produced."
   []
-  (let [st (seed-store)
-        runs (reduce
-              (fn [acc {:keys [phase request advisor] :as step}]
-                (let [opts (when (= :direct-execution advisor)
-                             {:advisor (direct-execution-advisor)})
-                      context (assoc operator :phase phase)
-                      result (operation/run-operation st request context opts)]
-                  (conj acc (assoc step :context context :result result))))
-              []
-              scenario)]
+  (let [st (store/mem-store {:initial-plantations plantation-seed})
+        runs (mapv (fn [{:keys [tid phase request advisor] :as sc}]
+                     (let [actor (operation/build st (when advisor {:advisor advisor}))
+                           result (actor request (ctx phase))]
+                       (assoc sc :tid tid :result result)))
+                   scenarios)]
     {:store st
      :runs runs
-     :ledger (vec (mapcat #(get-in % [:result :audit]) runs))}))
+     :ledger (vec (mapcat #(-> % :result :audit) runs))}))
 
-;; ---------------------------- rendering -----------------------------
+(defn- holds [ledger]
+  (filterv #(= :governor-hold (:t %)) ledger))
+
+(defn- hard-holds [ledger]
+  (filterv #(seq (:violations %)) (holds ledger)))
+
+;; ----------------------------- rendering -----------------------------
 
 (defn- esc [v]
   (-> (str v)
@@ -231,178 +222,253 @@
       (str/replace "<" "&lt;")
       (str/replace ">" "&gt;")))
 
-(defn- kw [v]
-  (if (keyword? v) (name v) (str v)))
+(defn- kw-str [v] (if (keyword? v) (name v) (str v)))
 
 (defn- basis-str [basis]
-  (str/join ", " (map kw basis)))
+  (if (seq basis) (str/join ", " (map kw-str basis)) ""))
 
-(defn- disposition-cell [disposition]
-  (case disposition
-    :commit   "<span class=\"ok\">committed</span>"
-    :escalate "<span class=\"warn\">escalated to human</span>"
-    :hold     "<span class=\"critical\">HARD hold</span>"
-    (str "<span class=\"muted\">" (esc (kw disposition)) "</span>")))
+(defn- fact-subject [f] (or (:subject f) (:plantation-id f)))
 
-(defn- outcome-detail
-  "The actor's own explanation of what happened, pulled out of the
-  disposition fact and verdict it emitted (never re-derived here).
+(defn- disposition-cell [d]
+  (case d
+    :commit "<span class=\"ok\">commit</span>"
+    :escalate "<span class=\"warn\">escalate &middot; human sign-off</span>"
+    :hold "<span class=\"critical\">HOLD</span>"
+    (str "<span class=\"muted\">" (esc (kw-str d)) "</span>")))
 
-  NOTE on `:escalate`: `oleaginousops.operation` collapses the
-  Governor's `high-cost?` and `always-escalate?` signals into one
-  `:high-stakes?` flag and then reports BOTH as reason
-  `:always-escalate`, so an over-threshold supply order shows that reason
-  too. That is the actor's real output; the verdict fields are printed
-  next to it rather than the reason being silently rewritten here."
-  [{:keys [disposition audit verdict]}]
+(defn- hold-reason [{:keys [audit]}]
   (let [f (last audit)]
-    (case disposition
-      :hold (str/join "<br>"
-                      (map (fn [v]
-                             (str "<code>" (esc (kw (:rule v))) "</code> &middot; "
-                                  (esc (:detail v))))
-                           (:violations f)))
-      :escalate (str "<code>" (esc (kw (:reason f))) "</code>"
-                     " &middot; confidence " (format "%.2f" (double (:confidence verdict)))
-                     (when (:high-stakes? verdict) " &middot; high-stakes"))
-      :commit (str "basis: " (esc (basis-str (:basis f))))
-      "")))
+    (cond
+      ;; plain "·" (not the &middot; entity): this string is escaped by
+      ;; `esc` on its way into the cell.
+      (seq (:violations f)) (str "HARD · " (basis-str (:basis f)))
+      (:phase-reason f) (str "phase gate · " (kw-str (:phase-reason f)))
+      :else "")))
 
-(defn- run-row [{:keys [label phase request result]}]
-  (format "        <tr><td>%s</td><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
-          (esc label)
-          (esc (kw (:op request)))
-          (esc (:plantation-id request))
-          (esc (kw phase))
-          (disposition-cell (:disposition result))
-          (outcome-detail result)))
+(defn- run-reason [{:keys [disposition audit] :as result}]
+  (case disposition
+    :hold (hold-reason result)
+    :escalate (kw-str (:reason (last audit)))
+    :commit (basis-str (:basis (last audit)))
+    ""))
 
-(defn- plantation-row [st id]
-  (let [{:keys [name fruit-class hectares]} (store/registered-plantation st id)
-        fc (facts/fruit-class-by-id fruit-class)]
-    (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-            (esc id) (esc name)
-            (esc (:name fc)) (esc (kw (:group fc)))
-            (esc hectares))))
+;; --- plantation register (real Store lookups) ---
 
-(defn- ledger-row [f]
-  (format "        <tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
-          (esc (kw (:t f)))
-          (esc (kw (:op f)))
-          (esc (or (:subject f) (:plantation-id f)))
-          (esc (if-let [c (:confidence f)] (format "%.2f" (double c)) ""))
-          (esc (cond
-                 (seq (:basis f)) (basis-str (:basis f))
-                 (:reason f) (kw (:reason f))
-                 (:proposal-summary f) (:proposal-summary f)
-                 :else ""))))
+(defn- register-rows [st ledger]
+  (let [seeded (set (keys @(:plantations st)))
+        referenced (set (keep fact-subject ledger))
+        ids (sort (into seeded referenced))]
+    (str/join "\n"
+      (for [id ids
+            :let [rec (store/registered-plantation st id)
+                  fc (some-> rec :fruit-class facts/fruit-class-by-id)
+                  touched (count (filter #(= id (fact-subject %)) ledger))]]
+        (str "        <tr><td><code>" (esc id) "</code></td><td>"
+             (esc (or (:name rec) "—")) "</td><td>"
+             (if fc (str (esc (:name fc)) " (" (esc (:id fc)) ", " (esc (kw-str (:group fc))) ")") "—")
+             "</td><td class=\"num\">" (if rec (esc (:hectares rec)) "—") "</td><td>"
+             (if rec
+               "<span class=\"ok\">registered</span>"
+               "<span class=\"critical\">NOT registered &middot; HARD invariant</span>")
+             "</td><td class=\"num\">" touched "</td></tr>")))))
 
-(defn- gate-cell
-  "Derived from the Governor's own vars -- not a hand-written
-  description of them."
-  [op]
+;; --- op gate contract ---
+
+(def ^:private op-notes
+  ;; STATIC hand-written description of this actor's FIXED op contract
+  ;; (README "Operational requests" + the governor docstring). This is
+  ;; the only hand-authored content on the page. It is documentation of
+  ;; fixed behaviour, not telemetry -- the op SETS, the confidence floor
+  ;; and the cost thresholds beside it are all read from the governor /
+  ;; facts vars below, and every observed outcome comes from the run.
+  {:log-plantation-record "Record planting / harvest-yield / oil-content-test data. The logged quantity is independently re-verified by oleaginousops.registry."
+   :schedule-field-operation "Propose a pruning / spraying / harvest window. Never makes or finalizes a spray-application decision."
+   :flag-crop-health-concern "Surface a pest / disease (bud rot, Ganoderma) or drought-stress concern for agronomist review."
+   :order-supplies "Procurement for seedlings, fertilizer or equipment, against the category cost threshold."
+   :operate-field-equipment "Direct operation of field equipment — the grower's exclusive authority."
+   :finalize-spray-application "Finalizing a spray-application decision — the agronomist's exclusive authority."})
+
+(defn- gate-label [op]
   (cond
     (contains? governor/blocked-ops op)
-    "<span class=\"critical\">HARD block, permanent &middot; never escalates, never overrides</span>"
-
+    "<span class=\"critical\">permanently blocked &middot; HARD, never overridable</span>"
     (contains? governor/always-escalate-ops op)
-    "<span class=\"warn\">ALWAYS human sign-off, even when the Governor is clean</span>"
-
-    (= :order-supplies op)
-    (str "<span class=\"warn\">escalates above the category cost threshold ("
-         (str/join ", "
-                   (map (fn [[id c]]
-                          (str (esc id) " " (:cost-threshold c)))
-                        (sort-by key facts/supply-categories)))
-         "; default " facts/default-cost-threshold ")</span>")
-
+    "<span class=\"warn\">ALWAYS human sign-off, at every phase</span>"
     :else
-    (str "<span class=\"ok\">commits when the Governor is clean and confidence &ge; "
-         (format "%.2f" (double governor/confidence-floor))
-         "</span>")))
+    "<span class=\"ok\">may commit when the Governor is clean and the phase gate allows</span>"))
 
-(defn- action-gate-rows []
-  (for [op (sort-by name governor/all-recognized-ops)]
-    (format "        <tr><td><code>%s</code></td><td>%s</td></tr>"
-            (esc (kw op)) (gate-cell op))))
+(defn- op-gate-rows []
+  (str/join "\n"
+    (for [op (sort-by name governor/all-recognized-ops)]
+      (str "        <tr><td><code>:" (esc (name op)) "</code></td><td>"
+           (gate-label op) "</td><td>" (esc (get op-notes op "—")) "</td></tr>"))))
 
-(defn- phase-gate-rows
-  "Computed by actually calling `phase/gate` for each phase against a
-  routine op and an always-escalate op."
-  []
-  (for [ph [:phase-0 :phase-1 :phase-2 :phase-3]]
-    (let [routine (phase/gate ph {:op :log-plantation-record} :commit)
-          health (phase/gate ph {:op :flag-crop-health-concern} :commit)]
-      (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
-              (esc (kw ph))
-              (str (disposition-cell (:disposition routine))
-                   (when-let [r (:reason routine)]
-                     (str " <code>" (esc (kw r)) "</code>")))
-              (str (disposition-cell (:disposition health))
-                   (when-let [r (:reason health)]
-                     (str " <code>" (esc (kw r)) "</code>")))))))
+(defn- threshold-rows []
+  (str/join "\n"
+    (for [[id c] (sort-by key facts/supply-categories)]
+      (str "        <tr><td><code>" (esc id) "</code></td><td>" (esc (:name c))
+           "</td><td class=\"num\">" (esc (:cost-threshold c)) "</td></tr>"))))
 
-(defn- committed-record-rows [runs]
-  (for [{:keys [request result]} runs
-        :when (:record result)
-        :let [{:keys [effect path value]} (:record result)]]
-    (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>"
-            (esc (kw (:op request)))
-            (esc (kw effect))
-            (esc (str/join "/" path))
-            (esc (pr-str (into (sorted-map) value))))))
+;; --- phase gate (computed by calling the real gate) ---
+
+(def ^:private phase-ids
+  ;; The four declared rollout phases, plus one deliberately unknown
+  ;; phase id so the gate's fail-closed default is shown by running it.
+  [:phase-0 :phase-1 :phase-2 :phase-3 :phase-9])
+
+(defn- gate-cell [ph req d]
+  (let [{:keys [disposition reason]} (phase/gate ph req d)]
+    (str (disposition-cell disposition)
+         (when reason (str " <span class=\"muted\">" (esc (kw-str reason)) "</span>")))))
+
+(defn- phase-rows []
+  (let [routine {:op :log-plantation-record}
+        always {:op :flag-crop-health-concern}]
+    (str/join "\n"
+      (for [ph phase-ids]
+        (str "        <tr><td><code>" (esc (kw-str ph)) "</code></td><td>"
+             (gate-cell ph routine :commit) "</td><td>"
+             (gate-cell ph always :commit) "</td><td>"
+             (gate-cell ph routine :hold) "</td></tr>")))))
+
+;; --- run timeline ---
+
+(defn- run-row [{:keys [tid phase request advisor feeds result]}]
+  (str "        <tr><td><code>" (esc tid) "</code></td><td><code>:"
+       (esc (name (:op request))) "</code></td><td><code>"
+       (esc (:plantation-id request)) "</code></td><td><code>"
+       (esc (kw-str phase)) "</code>"
+       (when advisor
+         (str "<br><span class=\"muted\">advisor: "
+              (esc (.getSimpleName (class advisor))) "</span>"))
+       "</td><td>" (disposition-cell (:disposition result))
+       "</td><td>" (esc (run-reason result))
+       "</td><td class=\"num\">" (esc (get-in result [:verdict :confidence]))
+       "</td><td class=\"muted\">" (esc feeds) "</td></tr>"))
+
+;; --- hard hold detail ---
+
+(defn- violation-rows [runs]
+  (str/join "\n"
+    (for [{:keys [tid result]} runs
+          :let [f (last (:audit result))]
+          :when (= :governor-hold (:t f))
+          v (or (seq (:violations f))
+                [{:rule (or (:phase-reason f) :hold)
+                  :detail "no Governor violation — held by the rollout phase gate"}])]
+      (str "        <tr><td><code>" (esc tid) "</code></td><td><code>"
+           (esc (fact-subject f)) "</code></td><td><code>:"
+           (esc (kw-str (:rule v))) "</code></td><td>" (esc (:detail v)) "</td></tr>"))))
+
+;; --- ledger ---
+
+(defn- ledger-row [{:keys [t op summary proposal-summary reason confidence basis] :as f}]
+  (str "        <tr><td>" (esc (kw-str t)) "</td><td><code>:"
+       (esc (kw-str (or op :n-a))) "</code></td><td><code>"
+       (esc (fact-subject f)) "</code></td><td class=\"num\">"
+       (if (some? confidence) (esc confidence) "—") "</td><td>"
+       (esc (or (not-empty (basis-str basis))
+                (some-> reason kw-str)
+                summary
+                proposal-summary
+                ""))
+       "</td></tr>"))
+
+;; --- committed records ---
+
+(defn- record-rows [runs]
+  (str/join "\n"
+    (for [{:keys [tid result]} runs
+          :when (:record result)
+          :let [r (:record result)]]
+      (str "        <tr><td><code>" (esc tid) "</code></td><td><code>"
+           (esc (kw-str (:effect r))) "</code></td><td><code>"
+           (esc (str/join "/" (:path r))) "</code></td><td><code>"
+           (esc (pr-str (:value r))) "</code></td></tr>"))))
 
 (defn render
-  "Renders the whole operator console from the result of
-  `run-scenario!`."
+  "Renders the whole operator-console document from the result of
+  `run-demo!` (or any other real run of this actor)."
   [{:keys [store runs ledger]}]
-  (let [holds (filter #(= :governor-hold (:t %)) ledger)
-        commits (filter #(= :committed (:t %)) ledger)
-        escalations (filter #(= :approval-requested (:t %)) ledger)]
+  (let [hs (holds ledger)
+        hh (hard-holds ledger)
+        by-disp (frequencies (map #(get-in % [:result :disposition]) runs))]
     (str
-     "<!doctype html>\n"
-     "<html lang=\"ja\"><head><meta charset=\"utf-8\">"
+     "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
      "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
      "<title>cloud-itonami-isic-0126 &middot; oleaginous-fruit plantation operations</title><style>"
      (jp-go-dds.skin/dds+skin)
      "</style></head><body>\n"
      "<header class=\"bar\">\n"
      "  <h1>Growing of oleaginous fruits (ISIC 0126) — Operator Console</h1>\n"
-     "  <span class=\"badge\">read-only sample · governor-gated · back-office coordination only — field-equipment operation and spray-application decisions are permanently blocked</span>\n"
+     "  <span class=\"badge\">read-only sample · governor-gated · field equipment and spray decisions permanently out of scope</span>\n"
      "</header>\n"
      "<main>\n"
 
      "  <section class=\"card\">\n"
-     "    <h2>Run summary</h2>\n"
-     "    <p class=\"muted\">Build-time-generated from the real actor stack "
-     "(<code>oleaginousops.advisor</code> → <code>oleaginousops.governor</code> → "
-     "<code>oleaginousops.phase</code> → <code>oleaginousops.operation/run-operation</code>) "
-     "by <code>clojure -M:dev:render-html</code>. Nothing on this page is hand-written data.</p>\n"
+     "    <h2>This run</h2>\n"
+     "    <p class=\"muted\">Generated at build time by <code>oleaginousops.render-html</code> (<code>clojure -M:dev:render-html</code>): every figure below is the actor's own output, produced by driving <code>oleaginousops.operation/build</code> over a real <code>oleaginousops.store/mem-store</code>. No clock, no randomness, no network — re-running writes a byte-identical file.</p>\n"
      "    <table>\n"
-     "      <thead><tr><th>Actor runs</th><th>Audit facts</th><th>Committed</th><th>Escalated to human</th><th>HARD holds</th></tr></thead>\n"
+     "      <thead><tr><th>Requests driven</th><th>Audit facts</th><th>Commits</th><th>Escalations</th><th>Holds</th><th>HARD holds</th></tr></thead>\n"
      "      <tbody>\n"
-     (format "        <tr><td>%d</td><td>%d</td><td><span class=\"ok\">%d</span></td><td><span class=\"warn\">%d</span></td><td><span class=\"critical\">%d</span></td></tr>"
-             (count runs) (count ledger) (count commits) (count escalations) (count holds))
-     "\n      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>Registered plantation blocks</h2>\n"
-     "    <p class=\"muted\">Read back out of the live <code>oleaginousops.store</code>. A block must be registered here before any proposal referencing it can be considered — an unregistered id is a HARD violation, not a warning.</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>Block</th><th>Name</th><th>Oil crop</th><th>Group</th><th>ha</th></tr></thead>\n"
-     "      <tbody>\n"
-     (str/join "\n" (map (partial plantation-row store) (map first seeded-plantations))) "\n"
+     "        <tr><td class=\"num\">" (count runs) "</td><td class=\"num\">" (count ledger)
+     "</td><td class=\"num\">" (get by-disp :commit 0)
+     "</td><td class=\"num\">" (get by-disp :escalate 0)
+     "</td><td class=\"num\">" (count hs)
+     "</td><td class=\"num\">" (count hh) "</td></tr>\n"
      "      </tbody>\n"
      "    </table>\n"
      "  </section>\n"
 
      "  <section class=\"card\">\n"
-     "    <h2>Scenario — what the actor decided</h2>\n"
-     "    <p class=\"muted\">Every disposition and every reason below is the actor's own output for that request. HARD holds never reach a human; escalations do. Observed here: <code>oleaginousops.operation</code> folds the Governor's cost gate and its always-escalate gate into one <code>:high-stakes?</code> flag, so an over-threshold supply order is reported with reason <code>always-escalate</code> as well — the reason is shown as emitted, not rewritten.</p>\n"
+     "    <h2>Plantation register</h2>\n"
+     "    <p class=\"muted\">Read back out of the Store with <code>store/registered-plantation</code> — including for every plantation-id this run referenced. A block that is not on this register cannot be acted on: the Governor's <code>:plantation-not-registered</code> invariant is a HARD hold.</p>\n"
      "    <table>\n"
-     "      <thead><tr><th>Step</th><th>Op</th><th>Block</th><th>Phase</th><th>Disposition</th><th>Actor's reason</th></tr></thead>\n"
+     "      <thead><tr><th>Plantation block</th><th>Name</th><th>Oil crop</th><th>ha</th><th>Register</th><th>Facts this run</th></tr></thead>\n"
+     "      <tbody>\n"
+     (register-rows store ledger) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Op gate (Oleaginous Operations Governor)</h2>\n"
+     "    <p class=\"muted\">Op sets read from <code>oleaginousops.governor</code> (<code>known-ops</code>, <code>blocked-ops</code>, <code>always-escalate-ops</code>). Any op outside this table is an <code>:op-not-allowed</code> HARD hold. Confidence floor <span class=\"num\">"
+     (esc governor/confidence-floor)
+     "</span> — a proposal below it escalates, and the Governor recomputes cost and logged quantity itself rather than trusting the advisor.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Op</th><th>Gate</th><th>Scope</th></tr></thead>\n"
+     "      <tbody>\n"
+     (op-gate-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "    <h3>Supply cost thresholds</h3>\n"
+     "    <p class=\"muted\">From <code>oleaginousops.facts/supply-categories</code>. An order above its threshold escalates; an uncategorised order falls back to <span class=\"num\">"
+     (esc facts/default-cost-threshold) "</span>.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Category</th><th>Name</th><th>Escalation threshold</th></tr></thead>\n"
+     "      <tbody>\n"
+     (threshold-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Rollout phase gate</h2>\n"
+     "    <p class=\"muted\">Each cell is computed by calling <code>oleaginousops.phase/gate</code> for that phase, not transcribed. A HARD hold passes through every phase unchanged — the phase gate can only tighten a decision, never loosen one — and an unrecognised phase fails closed.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Phase</th><th>Governor-clean routine op</th><th>Governor-clean always-escalate op</th><th>Governor HARD hold</th></tr></thead>\n"
+     "      <tbody>\n"
+     (phase-rows) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Run timeline</h2>\n"
+     "    <p class=\"muted\">One row = one request driven through the real actor. The last column states only what the request fed the Governor; disposition, reason and confidence are the run's own result.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>#</th><th>Op</th><th>Plantation</th><th>Phase</th><th>Disposition</th><th>Reason / basis</th><th>Conf.</th><th>What this request feeds</th></tr></thead>\n"
      "      <tbody>\n"
      (str/join "\n" (map run-row runs)) "\n"
      "      </tbody>\n"
@@ -410,43 +476,32 @@
      "  </section>\n"
 
      "  <section class=\"card\">\n"
-     "    <h2>Action gate (Oleaginous-Fruit Plantation Operations Governor)</h2>\n"
-     "    <p class=\"muted\">Derived from <code>governor/all-recognized-ops</code>, <code>governor/blocked-ops</code>, <code>governor/always-escalate-ops</code>, <code>governor/confidence-floor</code> and <code>facts/supply-categories</code> — if the rules change, this table changes with them.</p>\n"
+     "    <h2>HARD holds this run</h2>\n"
+     "    <p class=\"muted\">Rule names and detail text are the Governor's own <code>:violations</code> entries, taken off the ledger fact. A HARD hold never reaches a human — there is nothing to approve.</p>\n"
      "    <table>\n"
-     "      <thead><tr><th>Op</th><th>Gate</th></tr></thead>\n"
+     "      <thead><tr><th>#</th><th>Plantation</th><th>Rule</th><th>Governor detail</th></tr></thead>\n"
      "      <tbody>\n"
-     (str/join "\n" (action-gate-rows)) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>Rollout phase gate</h2>\n"
-     "    <p class=\"muted\">Computed by calling <code>oleaginousops.phase/gate</code> for each phase with an otherwise-committable verdict.</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>Phase</th><th>Routine op (<code>:log-plantation-record</code>)</th><th>Always-escalate op (<code>:flag-crop-health-concern</code>)</th></tr></thead>\n"
-     "      <tbody>\n"
-     (str/join "\n" (phase-gate-rows)) "\n"
+     (violation-rows runs) "\n"
      "      </tbody>\n"
      "    </table>\n"
      "  </section>\n"
 
      "  <section class=\"card\">\n"
      "    <h2>Committed records</h2>\n"
-     "    <p class=\"muted\">The commit payloads the actor actually produced. <code>:effect</code> is <code>propose</code> on every one of them — this actor never executes in the field.</p>\n"
+     "    <p class=\"muted\">The commit records <code>operation/run-operation</code> returned for the runs that reached <code>:commit</code>. This repo's Store is a plantation register, not yet the record SSoT, so these are the actor's returned records rather than persisted rows — stated plainly rather than dressed up.</p>\n"
      "    <table>\n"
-     "      <thead><tr><th>Op</th><th>Effect</th><th>Path</th><th>Value</th></tr></thead>\n"
+     "      <thead><tr><th>#</th><th>Effect</th><th>Path</th><th>Value</th></tr></thead>\n"
      "      <tbody>\n"
-     (str/join "\n" (committed-record-rows runs)) "\n"
+     (record-rows runs) "\n"
      "      </tbody>\n"
      "    </table>\n"
      "  </section>\n"
 
      "  <section class=\"card\">\n"
      "    <h2>Audit ledger (this run)</h2>\n"
-     "    <p class=\"muted\">Every fact the actor emitted, in emission order — one advisor proposal plus one disposition fact per run.</p>\n"
+     "    <p class=\"muted\">Append-only decision-fact log, in order: every advisor proposal and every disposition this scenario produced.</p>\n"
      "    <table>\n"
-     "      <thead><tr><th>Fact</th><th>Op</th><th>Block</th><th>Confidence</th><th>Basis / reason</th></tr></thead>\n"
+     "      <thead><tr><th>Fact</th><th>Op</th><th>Plantation</th><th>Conf.</th><th>Basis / reason / summary</th></tr></thead>\n"
      "      <tbody>\n"
      (str/join "\n" (map ledger-row ledger)) "\n"
      "      </tbody>\n"
@@ -454,27 +509,25 @@
      "  </section>\n"
 
      "</main>\n"
-     "<footer class=\"footer\"><p class=\"muted\">Regenerate with <code>clojure -M:dev:render-html</code>. The generator refuses to write this file if the run produces no HARD hold.</p></footer>\n"
+     "<footer><p>cloud-itonami-isic-0126 · AGPL-3.0-or-later · generated from a real actor run, not a mock-up.</p></footer>\n"
      "</body></html>\n")))
 
 (defn -main [& args]
   (let [out (or (first args) "docs/samples/operator-console.html")
-        {:keys [ledger runs] :as result} (run-scenario!)
-        holds (filter #(= :governor-hold (:t %)) ledger)
-        commits (filter #(= :committed (:t %)) ledger)]
-    (when (zero? (count holds))
-      (throw (ex-info
-              (str "refusing to write " out
-                   ": the scenario produced ZERO :governor-hold facts. "
-                   "An operator console that cannot show a HARD hold is not "
-                   "evidence that the Governor can reject anything. Fix the "
-                   "scenario (or the Governor) before regenerating.")
-              {:out out
-               :runs (count runs)
-               :ledger-facts (count ledger)
-               :governor-holds 0})))
-    (spit out (render result))
-    (println "wrote" out "-" (count runs) "actor runs,"
-             (count ledger) "audit facts,"
-             (count commits) "committed,"
-             (count holds) "HARD holds")))
+        {:keys [ledger] :as result} (run-demo!)
+        hs (holds ledger)
+        hh (hard-holds ledger)]
+    ;; Build-time invariant: a console that shows no real HARD hold is
+    ;; not evidence of a governor.
+    (when (empty? hs)
+      (throw (ex-info "no :governor-hold fact on the ledger — refusing to write a console that shows no real hold"
+                      {:ledger-facts (count ledger)})))
+    (when (empty? hh)
+      (throw (ex-info "no :governor-hold fact carries governor :violations — refusing to write a console whose only holds are phase-gate holds"
+                      {:ledger-facts (count ledger) :holds (count hs)})))
+    (let [f (java.io.File. ^String out)]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f (render result)))
+    (println "wrote" out
+             (str "(" (count ledger) " ledger facts, " (count hs) " holds, "
+                  (count hh) " HARD holds)"))))
