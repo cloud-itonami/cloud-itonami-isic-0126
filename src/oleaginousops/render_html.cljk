@@ -36,7 +36,7 @@
   HARD hold is not evidence that the Governor works, so the requirement
   is enforced at build time rather than left as a convention.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
+  Usage: `kbb -M:dev:render-html [out-file]`
   (default `docs/samples/operator-console.html`)."
   (:require [kotoba.lang.text :as str]
             [jp-go-dds.skin]
@@ -377,7 +377,7 @@
      "    <p class=\"muted\">Build-time-generated from the real actor stack "
      "(<code>oleaginousops.advisor</code> → <code>oleaginousops.governor</code> → "
      "<code>oleaginousops.phase</code> → <code>oleaginousops.operation/run-operation</code>) "
-     "by <code>clojure -M:dev:render-html</code>. Nothing on this page is hand-written data.</p>\n"
+     "by <code>kbb -M:dev:render-html</code>. Nothing on this page is hand-written data.</p>\n"
      "    <table>\n"
      "      <thead><tr><th>Actor runs</th><th>Audit facts</th><th>Committed</th><th>Escalated to human</th><th>HARD holds</th></tr></thead>\n"
      "      <tbody>\n"
@@ -454,7 +454,7 @@
      "  </section>\n"
 
      "</main>\n"
-     "<footer class=\"footer\"><p class=\"muted\">Regenerate with <code>clojure -M:dev:render-html</code>. The generator refuses to write this file if the run produces no HARD hold.</p></footer>\n"
+     "<footer class=\"footer\"><p class=\"muted\">Regenerate with <code>kbb -M:dev:render-html</code>. The generator refuses to write this file if the run produces no HARD hold.</p></footer>\n"
      "</body></html>\n")))
 
 (defn -main [& args]

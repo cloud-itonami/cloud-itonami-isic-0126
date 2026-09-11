@@ -17,7 +17,7 @@ full transparency over decisions.
 `oleaginousops.operation` following the itonami actor pattern
 (ADR-2607011000): `advise -> govern -> phase-gate -> commit | escalate |
 hold`. See [Testing](#testing) below for the current green test count
-(`clojure -M:test`).
+(`kbb -M:test`).
 
 `oleaginousops.operation` is a synchronous stub of this flow (see its
 docstring) — production wiring into a `langgraph-clj` StateGraph with
@@ -117,7 +117,7 @@ Mirrors `cloud-itonami-isic-0125` (`berrynutops.*`) module-for-module:
 - `oleaginousops.governor` — `OleaginousOperationsGovernor`: hard invariants + escalation gates
 - `oleaginousops.phase` — 0→3 rollout phase gate
 - `oleaginousops.operation` — composes advisor → governor → phase into one operation run
-- `oleaginousops.sim` — demo runner (`clojure -M:run`)
+- `oleaginousops.sim` — demo runner (`kbb -M:run`)
 
 ## Capability layer
 
@@ -135,9 +135,9 @@ See [`docs/business-model.md`](docs/business-model.md) and
 ## Testing
 
 ```bash
-clojure -M:test   # run the suite (see raw output for tests/assertions)
-clojure -M:lint   # clj-kondo, 0 errors / 0 warnings
-clojure -M:run    # demo runner
+kbb -M:test   # run the suite (see raw output for tests/assertions)
+kbb -M:lint   # clj-kondo, 0 errors / 0 warnings
+kbb -M:run    # demo runner
 ```
 
 ## License
