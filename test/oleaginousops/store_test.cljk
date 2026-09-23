@@ -1,5 +1,5 @@
 (ns oleaginousops.store-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [oleaginousops.store :as store]))
 
 (deftest mem-store-creation
