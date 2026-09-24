@@ -1,0 +1,33 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": a facility-management robot keeps plantation
+;; block records, schedules field operations and handles supplies for an
+;; oleaginous-fruit plantation (ISIC 0126, oil palm, olives, coconuts). Its
+;; physical work: lifting cut oil-palm fresh fruit bunches into the in-field
+;; carrier and hauling them over terraced ground to the collection platform.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-0126"
+ :cases
+ [{:id :fresh-fruit-bunch-into-carrier
+   :kind :manipulator
+   :procedure "grab arm lifts a cut oil-palm fresh fruit bunch from the ground into the carrier tray"
+   :params {:l1-m 0.80 :l2-m 0.70 :m1-kg 12.0 :m2-kg 8.0
+            :from [0.90 -0.30] :to [0.40 0.80] :duration-s 3.0 :steps 600}
+   :sweep {:param :payload-kg :values [10.0 20.0 30.0 40.0 50.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 600.0 :basis "estimate: continuous shoulder torque of a 50 kg-class heavy-payload arm"}
+   :boundary {:lo 1.0 :hi 200.0}}
+  {:id :bunches-over-terrace-to-platform
+   :kind :transport
+   :procedure "tracked carrier hauls a load of fresh fruit bunches up the terrace path to the collection platform"
+   :params {:mass-kg 350.0 :payload-kg 600.0 :distance-m 250.0 :v-max-mps 1.5 :a-max-mps2 0.5
+            :brake-decel-mps2 1.0 :drive-force-n 2200.0 :crr 0.09
+            :cog-height-m 0.70 :support-half-length-m 0.60 :max-time-s 3600.0}
+   :sweep {:param :slope-deg :values [0.0 3.0 6.0 9.0 12.0]}
+   :quantity :cycle-time-s
+   :limit {:max 220.0 :basis "estimate: bunches reach the platform within one haul cycle so they are milled inside the same day"}
+   :boundary {:lo 0.0 :hi 20.0}}]}
